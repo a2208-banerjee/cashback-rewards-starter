@@ -6,6 +6,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 
 @Entity
 @Table(name = "purchases")
@@ -24,15 +25,19 @@ class PurchaseEntity {
 	@Column(precision = 19, scale = 2)
 	private BigDecimal cashback;
 
+	private Instant postedAt;
+
 	protected PurchaseEntity() {
 	}
 
-	PurchaseEntity(String purchaseId, String customerId, String merchantId, BigDecimal amount, BigDecimal cashback) {
+	PurchaseEntity(String purchaseId, String customerId, String merchantId, BigDecimal amount, BigDecimal cashback,
+			Instant postedAt) {
 		this.purchaseId = purchaseId;
 		this.customerId = customerId;
 		this.merchantId = merchantId;
 		this.amount = amount;
 		this.cashback = cashback;
+		this.postedAt = postedAt;
 	}
 
 	String getPurchaseId() {
@@ -53,5 +58,9 @@ class PurchaseEntity {
 
 	BigDecimal getCashback() {
 		return cashback;
+	}
+
+	Instant getPostedAt() {
+		return postedAt;
 	}
 }

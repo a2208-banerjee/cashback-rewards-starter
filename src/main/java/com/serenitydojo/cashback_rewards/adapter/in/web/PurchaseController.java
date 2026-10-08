@@ -20,7 +20,8 @@ public class PurchaseController {
 	@PostMapping("/purchases")
 	@ResponseStatus(HttpStatus.CREATED)
 	public PurchaseResponse purchase(@Valid @RequestBody PurchaseRequest request) {
-		var cashback = purchaseUseCase.purchase(request.customerId(), request.merchantId(), request.amount());
+		var cashback = purchaseUseCase.purchase(request.customerId(), request.merchantId(), request.mcc(),
+				request.amount(), request.postedAt());
 		return new PurchaseResponse(cashback);
 	}
 }

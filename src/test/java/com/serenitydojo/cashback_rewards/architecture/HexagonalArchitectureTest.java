@@ -3,8 +3,6 @@ package com.serenitydojo.cashback_rewards.architecture;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
-import com.tngtech.archunit.junit.AnalyzeClasses;
-import com.tngtech.archunit.junit.ArchTest;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -14,10 +12,6 @@ import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static com.tngtech.archunit.library.Architectures.layeredArchitecture;
 
 @DisplayName("Hexagonal architecture")
-
-@AnalyzeClasses(packages = "com.serenitydojo.cashback_rewards",
-		importOptions = ImportOption.DoNotIncludeTests.class)
-
 class HexagonalArchitectureTest {
 
 	private static final String BASE_PACKAGE = "com.serenitydojo.cashback_rewards";
@@ -37,7 +31,7 @@ class HexagonalArchitectureTest {
 	@DisplayName("Domain isolation")
 	class DomainIsolation {
 
-		@ArchTest
+		@Test
 		@DisplayName("domain must not depend on Spring")
 		void domainMustNotDependOnSpring() {
 			noClasses().that().resideInAPackage("..domain..")
@@ -47,7 +41,7 @@ class HexagonalArchitectureTest {
 					.check(productionClasses);
 		}
 
-		@ArchTest
+		@Test
 		@DisplayName("domain must not depend on Jakarta Persistence")
 		void domainMustNotDependOnJakartaPersistence() {
 			noClasses().that().resideInAPackage("..domain..")
@@ -63,7 +57,7 @@ class HexagonalArchitectureTest {
 	class LayerDependencies {
 
 
-		@ArchTest
+		@Test
 		@DisplayName("dependencies must flow inward: adapter -> application -> domain")
 		void dependenciesMustFlowInward() {
 			layeredArchitecture()

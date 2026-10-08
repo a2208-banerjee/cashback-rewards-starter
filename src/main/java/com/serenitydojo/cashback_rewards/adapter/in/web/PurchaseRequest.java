@@ -1,6 +1,11 @@
 package com.serenitydojo.cashback_rewards.adapter.in.web;
 
-import java.math.BigDecimal;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 
-public record PurchaseRequest(String customerId, String merchantId, BigDecimal amount) {
+import java.math.BigDecimal;
+import java.time.Instant;
+
+public record PurchaseRequest(@NotBlank String customerId, @NotBlank String merchantId, String mcc,
+		@NotNull BigDecimal amount, Instant postedAt) {
 }

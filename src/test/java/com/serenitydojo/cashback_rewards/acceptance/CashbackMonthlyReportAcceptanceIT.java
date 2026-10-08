@@ -12,6 +12,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.math.BigDecimal;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -38,38 +39,46 @@ class CashbackMonthlyReportAcceptanceIT {
 		@DisplayName("The one where a member requests their report for March 2026 — the report contains every cashback event with a posting date between 1 March 00:00 and 31 March 23:59 in the member's local timezone")
 		void reportContainsEveryEventPostedWithinTheRequestedMonth() throws Exception {
 			registerMember("march-member", "UTC");
-			configureMerchant("march-merchant", "0.02");
 
 			purchase("march-member", "march-merchant", "300.00", "2026-02-28T23:59:00Z");
 			purchase("march-member", "march-merchant", "100.00", "2026-03-01T00:00:00Z");
 			purchase("march-member", "march-merchant", "200.00", "2026-03-31T23:59:00Z");
 			purchase("march-member", "march-merchant", "400.00", "2026-04-01T00:00:00Z");
 
-			List<BigDecimal> marchEntries = reportEntryCashback("march-member", "2026-03");
+			JsonNode marchReport = requestReport("march-member", "2026-03");
 
-			assertThat(marchEntries)
+			assertThat(marchReport.get("month").asString()).isEqualTo("2026-03");
+			assertThat(marchReport.get("timezone").asString()).isEqualTo("UTC");
+			assertThat(postedAtOfEntries(marchReport)).containsExactly(
+					OffsetDateTime.parse("2026-03-01T00:00:00Z"),
+					OffsetDateTime.parse("2026-03-31T23:59:00Z"));
+			assertThat(cashbackOfEntries(marchReport))
 					.usingElementComparator(BigDecimal::compareTo)
-					.containsExactlyInAnyOrder(new BigDecimal("2.00"), new BigDecimal("4.00"));
+					.containsExactly(new BigDecimal("2.00"), new BigDecimal("4.00"));
 		}
 
 		@Test
 		@DisplayName("The one where a member in UTC+13 has a transaction that posts at 11pm local on 31 March — it appears in the March report, not April, because we use the member's local month")
 		void eventsAreAssignedToTheMonthInTheMembersLocalTimezone() throws Exception {
 			registerMember("tonga-member", "Pacific/Tongatapu");
-			configureMerchant("tonga-merchant", "0.02");
 
 			// 23:00 on 31 March local time (UTC+13)
 			purchase("tonga-member", "tonga-merchant", "100.00", "2026-03-31T10:00:00Z");
 			// 00:30 on 1 April local time (UTC+13), still 31 March in UTC
 			purchase("tonga-member", "tonga-merchant", "500.00", "2026-03-31T11:30:00Z");
 
-			List<BigDecimal> marchEntries = reportEntryCashback("tonga-member", "2026-03");
-			List<BigDecimal> aprilEntries = reportEntryCashback("tonga-member", "2026-04");
+			JsonNode marchReport = requestReport("tonga-member", "2026-03");
+			JsonNode aprilReport = requestReport("tonga-member", "2026-04");
 
-			assertThat(marchEntries)
+			assertThat(marchReport.get("timezone").asString()).isEqualTo("Pacific/Tongatapu");
+			assertThat(postedAtOfEntries(marchReport))
+					.containsExactly(OffsetDateTime.parse("2026-03-31T23:00:00+13:00"));
+			assertThat(cashbackOfEntries(marchReport))
 					.usingElementComparator(BigDecimal::compareTo)
 					.containsExactly(new BigDecimal("2.00"));
-			assertThat(aprilEntries)
+			assertThat(postedAtOfEntries(aprilReport))
+					.containsExactly(OffsetDateTime.parse("2026-04-01T00:30:00+13:00"));
+			assertThat(cashbackOfEntries(aprilReport))
 					.usingElementComparator(BigDecimal::compareTo)
 					.containsExactly(new BigDecimal("10.00"));
 		}
@@ -84,31 +93,35 @@ class CashbackMonthlyReportAcceptanceIT {
 				.andExpect(status().isCreated());
 	}
 
-	private void configureMerchant(String merchantId, String cashbackRate) throws Exception {
-		mockMvc.perform(post("/merchants")
-						.contentType(MediaType.APPLICATION_JSON)
-						.content("""
-								{"merchantId": "%s", "cashbackRate": %s}
-								""".formatted(merchantId, cashbackRate)))
-				.andExpect(status().isCreated());
-	}
-
+	/** Purchases are made at a Groceries merchant (MCC 5411), which earns 2%. */
 	private void purchase(String customerId, String merchantId, String amount, String postedAt) throws Exception {
 		mockMvc.perform(post("/purchases")
 						.contentType(MediaType.APPLICATION_JSON)
 						.content("""
-								{"customerId": "%s", "merchantId": "%s", "amount": %s, "postedAt": "%s"}
+								{"customerId": "%s", "merchantId": "%s", "mcc": "5411", "amount": %s, "postedAt": "%s"}
 								""".formatted(customerId, merchantId, amount, postedAt)))
 				.andExpect(status().isCreated());
 	}
 
-	private List<BigDecimal> reportEntryCashback(String memberId, String month) throws Exception {
+	private JsonNode requestReport(String memberId, String month) throws Exception {
 		String responseBody = mockMvc.perform(get("/members/{memberId}/cashback-reports/{month}", memberId, month))
 				.andExpect(status().isOk())
 				.andReturn().getResponse().getContentAsString();
 
+		return jsonMapper.readTree(responseBody);
+	}
+
+	private List<OffsetDateTime> postedAtOfEntries(JsonNode report) {
+		List<OffsetDateTime> postedAt = new ArrayList<>();
+		for (JsonNode entry : report.get("entries")) {
+			postedAt.add(OffsetDateTime.parse(entry.get("postedAt").asString()));
+		}
+		return postedAt;
+	}
+
+	private List<BigDecimal> cashbackOfEntries(JsonNode report) {
 		List<BigDecimal> cashback = new ArrayList<>();
-		for (JsonNode entry : jsonMapper.readTree(responseBody).get("entries")) {
+		for (JsonNode entry : report.get("entries")) {
 			cashback.add(entry.get("cashback").decimalValue());
 		}
 		return cashback;

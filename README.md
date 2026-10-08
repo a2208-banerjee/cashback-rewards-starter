@@ -77,22 +77,28 @@ The project follows **hexagonal architecture** (ports and adapters). Dependencie
 ```
 src/main/java/com/serenitydojo/cashback_rewards/
 ├── domain/                          # Pure business logic — no frameworks
-│   ├── model/                       # Entities and value objects (Java records)
-│   │   ├── Merchant.java
-│   │   ├── CashbackRecord.java
-│   │   ├── ProductCategory.java
-│   │   └── ProductCashbackTotal.java
-│   ├── service/                     # Domain services (e.g. CashbackCalculator)
+│   ├── model/                       # Value objects (Java records)
+│   │   ├── Member.java              #   member id + local timezone
+│   │   ├── Purchase.java            #   a purchase with the cashback it earned and when it posted
+│   │   ├── CashbackEvent.java       #   one line of a cashback report
+│   │   └── MonthlyCashbackReport.java
+│   ├── service/                     # Domain services
+│   │   ├── CashbackCalculator.java        # rate × amount, half-up to 2 decimals
+│   │   ├── CategoryRateResolver.java      # merchant category code (MCC) -> rate
+│   │   └── CashbackReportCalculator.java  # month selection in local timezone, ordering, total
 │   └── exception/                   # Business rule exceptions
 │
 ├── application/                     # Use-case orchestration
-│   ├── port/in/                     # Inbound ports (interfaces for controllers)
-│   ├── port/out/                    # Outbound ports (interfaces for persistence)
+│   ├── port/in/                     # Inbound ports (RegisterMember, Purchase, CashbackReport use cases)
+│   ├── port/out/                    # Outbound ports (save/find members and purchases)
 │   └── service/                     # Application services (@Service beans)
 │
-└── adapter/                         # Framework-dependent code
-    ├── in/web/                      # REST controllers (@RestController)
-    └── out/persistence/             # JPA repositories and entities
+├── adapter/                         # Framework-dependent code
+│   ├── in/web/                      # REST controllers, request/response DTOs, ApiExceptionHandler
+│   └── out/persistence/             # JPA entities, Spring Data repositories, persistence adapters
+│
+├── ClockConfiguration.java          # Clock bean, so time can be fixed in tests
+└── DomainConfiguration.java         # Exposes the framework-free domain services as beans
 ```
 
 ### Test Structure
@@ -101,18 +107,19 @@ Tests mirror the production structure and follow Maven naming conventions:
 
 ```
 src/test/java/com/serenitydojo/cashback_rewards/
-├── acceptance/                      # *IT.java — end-to-end, run with mvn verify
+├── acceptance/                      # *IT.java — end-to-end, run with mvn verify (failsafe)
 │   ├── BasicCashbackCalculationIT.java
-│   ├── MerchantCategoriesAndEligibilityIT.java
-│   └── TotalCashbackPerProductIT.java
+│   ├── MerchantCategoriesAndEligibilityAcceptanceIT.java
+│   └── CashbackMonthlyReportAcceptanceIT.java
 │
+├── architecture/                    # ArchUnit rules: domain isolation and inward-only dependencies
 ├── domain/                          # Plain JUnit + AssertJ, no Spring
 ├── application/service/             # Unit tests for application services
 ├── adapter/in/web/                  # @WebMvcTest for controllers
 └── adapter/out/persistence/         # @DataJpaTest for repositories
 ```
 
-Run `./mvnw test` for unit tests only, or `./mvnw verify` for unit + acceptance tests.
+Run `./mvnw test` for unit and architecture tests only, or `./mvnw verify` for those plus the acceptance tests.
 
 ## Specifications
 
@@ -121,10 +128,26 @@ Feature specifications live in `doc/specs/` and follow the **Example Mapping** f
 | Spec File | Feature |
 |---|---|
 | `earning-cashback.md` | Core user story for earning cashback on purchases |
-| `basic-cashback-calculation.md` | Cashback rate calculation, time-effective rates, settlement rules |
+| `basic-cashback-calculation.md` | Original cashback calculation rules (rounds down, per-merchant rates) |
+| `basic-cashback-calculation-pending.md` | Revised calculation rules (rounds half-up, pending and available balances, refunds) |
 | `merchant-categories-and-eligibility.md` | Category-based rates (MCC codes), eligibility rules, card status checks |
 | `cashback-monthly-report.md` | Monthly cashback reporting |
-| `total-cashback-per-product.md` | System-wide cashback totals by product category |
+
+**Where specs disagree, `merchant-categories-and-eligibility.md` wins.** It replaces per-merchant rates with rates derived from the merchant category code, so the "rate configured for the merchant" and "rate in force at the time of purchase" rules in the two basic-calculation specs no longer apply as written.
+
+**Implemented so far:** the category rate rule, and the monthly report's month selection (in the member's local timezone), ordering and total. Not yet implemented: the eligibility rules (posted transactions, active cards, purchases only), pending and available balances, refunds as clawbacks, and the monthly cap.
+
+## API
+
+The REST contract lives in `doc/api/cashback-api.yaml` (OpenAPI 3.0). The service runs on port 8080.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /members` | Register a member with their local timezone. `409` if the id already exists. |
+| `POST /purchases` | Record a purchase and get the cashback it earned. The rate comes from the `mcc` field: Groceries 2%, Fuel 1%, anything else 0.5%. |
+| `GET /members/{memberId}/cashback-reports/{month}` | Monthly cashback report for `YYYY-MM`, in the member's local timezone. |
+
+Errors use `application/problem+json`: `400` for invalid input, `404` for an unknown member, `409` for a duplicate member. The contract still lists `capReached` and `forfeitedAmount` on the report, which the service does not return yet.
 
 ## Claude Code Setup
 
@@ -158,7 +181,7 @@ Reusable prompts for the spec-driven development workflow:
 
 ### Hooks (`.claude/settings.json`)
 
-The project includes a PostToolUse hook that automatically runs `mvn test` after every file edit, ensuring Claude never moves forward with broken code.
+The project includes a PostToolUse hook that automatically runs `mvn verify -q` (unit, architecture and acceptance tests) after every file edit, ensuring Claude never moves forward with broken code.
 
 ## Architecture Decisions
 
@@ -166,18 +189,24 @@ The project includes a PostToolUse hook that automatically runs `mvn test` after
 
 **Hexagonal architecture** — Domain code is framework-free. Spring and JPA live only in adapters. This makes the domain testable with plain JUnit — no Spring context needed.
 
-**In-memory repositories for tests** — Acceptance tests use in-memory implementations of outbound ports, so they run fast without a database. Repository tests use `@DataJpaTest` with H2 in PostgreSQL compatibility mode.
+**Real persistence in every test that needs it** — Acceptance tests run the full stack (controller, service, domain, JPA) against Spring Boot's default in-memory H2 database, with no mocks. Repository tests use `@DataJpaTest`. Application services are unit tested with their outbound ports stubbed as lambdas, which is why each outbound port is a small single-purpose interface.
+
+**Architecture is enforced, not just documented** — `HexagonalArchitectureTest` (ArchUnit) fails the build if the domain imports Spring or JPA, or if a dependency points outward.
+
+**Time comes from a `Clock`** — Services that need "now" take a `Clock`, so tests can fix the time.
+
+**Rates come from the merchant category code** — `CategoryRateResolver` maps an MCC to a rate. Merchants are not registered and carry no rate of their own.
 
 **Specs as the source of truth** — Feature specifications in `doc/specs/` define the contract. Acceptance tests verify the contract. Production code implements it. When specs change, tests change first.
 
 ## Useful Commands
 
 ```bash
-./mvnw test                              # Unit tests only
-./mvnw verify                            # Unit + acceptance tests
-./mvnw -Dtest=CashbackCalculatorTest test # Single test class
-./mvnw spring-boot:run                   # Run the app (needs PostgreSQL)
-./mvnw clean package                     # Build the JAR
+./mvnw test                                    # Unit and architecture tests only
+./mvnw verify                                  # Unit, architecture and acceptance tests
+./mvnw -Dtest=CashbackReportCalculatorTest test # Single test class
+./mvnw spring-boot:run                         # Run the app on port 8080 (in-memory H2, no setup needed)
+./mvnw clean package                           # Build the JAR
 ```
 
 ### With Claude Code
