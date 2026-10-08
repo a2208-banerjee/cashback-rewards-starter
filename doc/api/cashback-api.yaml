@@ -1,0 +1,393 @@
+openapi: 3.0.3
+info:
+  title: Cashback Rewards API
+  version: 0.1.0-draft
+  description: |
+    Draft contract for registering members, recording purchases and reading the monthly cashback
+    report. Derived from the Example Maps in `doc/specs/cashback-monthly-report.md` and
+    `doc/specs/merchant-categories-and-eligibility.md`.
+
+    **Conventions (from CLAUDE.md)**
+    - JSON over REST. 200 for queries, 400 for validation failures, 404 when a resource does not exist.
+    - All monetary values are decimals with exactly 2 fraction digits, never floating point. They are
+      serialised as JSON numbers with scale 2 (for example `2.00`) and MUST be read into a
+      `BigDecimal` (Java) or an equivalent decimal type, never into `double`.
+    - Cashback amounts are signed: earnings are positive, refund clawbacks are negative.
+    - Errors use RFC 9457 `application/problem+json` and never expose infrastructure details.
+
+    **Assumptions made where the spec still has open questions**
+    These are defaults so the contract can be drafted. Each must be confirmed or changed in the spec
+    before implementation:
+    1. The report is for one calendar month in the member's own timezone, including the current
+       month (month-to-date). Spec question: "Can a member request the current month-to-date?"
+    2. Any past month is accepted; no retention window is enforced. Spec question: "How far back?"
+    3. The member's single stored timezone is used. Spec question: "Which timezone applies after a
+       mid-month change?"
+    4. Each entry carries posting time, merchant and signed cashback amount only. Spec question:
+       "What identifying details does each entry need?"
+    5. Clawbacks are standalone entries, not linked to the original purchase.
+    6. Entries are ordered by `postedAt`, oldest first. Spec question: "How are entries ordered?"
+    7. The total may be negative; it is not floored at 0.00.
+    8. The cap indicator and forfeited amount are shown only when the cap was reached. The cap value
+       itself is not part of the report.
+    9. Authentication and authorisation are out of scope for this draft. The rule "only the
+       requesting member's own report" must be enforced by whichever mechanism is chosen
+       (agent access is a separate story).
+servers:
+  - url: http://localhost:8080
+    description: Local development
+tags:
+  - name: Members
+    description: Registering members and their local timezone
+  - name: Purchases
+    description: Recording purchases and the cashback they earn
+  - name: Cashback reports
+    description: Monthly cashback reporting for a member
+paths:
+  /members:
+    post:
+      tags: [Members]
+      operationId: registerMember
+      summary: Register a member with their local timezone
+      description: |
+        Registers a new member. The timezone decides which calendar month each of the member's
+        purchases belongs to in their cashback report.
+
+        A member id can be registered only once. Registering an id that already exists is rejected
+        with 409 and the stored member is left unchanged, so a past report can never silently move to
+        a different timezone. This holds even when two registrations of the same new id arrive at the
+        same moment: exactly one succeeds.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterMemberRequest'
+            example:
+              memberId: member-123
+              timezone: Pacific/Tongatapu
+      responses:
+        '201':
+          description: The member was registered. The response has no body.
+        '400':
+          description: |
+            The `memberId` is blank, the `timezone` is missing, or the `timezone` is not a known IANA
+            timezone id.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: about:blank
+                title: Bad Request
+                status: 400
+                detail: Failed to read request
+                instance: /members
+        '409':
+          description: A member with this id is already registered. The existing member is unchanged.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: about:blank
+                title: Member already exists
+                status: 409
+                detail: 'Member already exists: member-123'
+                instance: /members
+  /purchases:
+    post:
+      tags: [Purchases]
+      operationId: recordPurchase
+      summary: Record a purchase and get the cashback it earned
+      description: |
+        Records a purchase and returns the cashback it earned, rounded half-up to 2 decimal places.
+
+        **The rate comes from the merchant's category, which is derived from its merchant category
+        code (`mcc`):**
+
+        | MCC | Category | Rate |
+        |---|---|---|
+        | 5411, 5422, 5441, 5451, 5462 | Groceries | 2% |
+        | 5541, 5542 | Fuel | 1% |
+        | any other code, or no `mcc` | Default | 0.5% |
+
+        A missing or unrecognised `mcc` is not an error: it earns the Default rate. The merchant does
+        not have to be registered anywhere.
+
+        If `postedAt` is omitted, the purchase is posted at the current time. The purchase is stored
+        with the cashback it earned and its posting time, and appears in the customer's monthly
+        report for the month it was posted in, in the member's local timezone. The `customerId` is
+        the member id used for the report.
+
+        Not yet enforced (see the eligibility spec): only posted purchases on active cards earn
+        cashback, refunds and fees earn nothing, and amounts with more than two decimal places are
+        accepted without validation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurchaseRequest'
+            example:
+              customerId: member-123
+              merchantId: grocery-mart
+              mcc: '5411'
+              amount: 100.00
+              postedAt: '2026-03-04T10:15:00Z'
+      responses:
+        '201':
+          description: The purchase was recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PurchaseResponse'
+              example:
+                cashback: 2.00
+        '400':
+          description: |
+            `customerId` or `merchantId` is missing or blank, `amount` is missing, or the body is not
+            valid JSON or has a value of the wrong type (for example a `postedAt` that is not a date-time).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: about:blank
+                title: Bad Request
+                status: 400
+                detail: Invalid request content.
+                instance: /purchases
+  /members/{memberId}/cashback-reports/{month}:
+    get:
+      tags: [Cashback reports]
+      operationId: getMonthlyCashbackReport
+      summary: Get a member's cashback report for one calendar month
+      description: |
+        Returns every cashback event whose posting time falls within the requested calendar month,
+        evaluated in the member's local timezone. For example, in the March 2026 report, an event
+        posted at 23:00 on 31 March local time is included even when that instant is already
+        1 April in UTC, and an event at 00:30 on 1 April local time is excluded.
+
+        Refund clawbacks appear in the month in which they happened, as negative entries, even when
+        the original earning was in a previous month. Purchases that earned no cashback (for example
+        gift cards) do not appear.
+
+        A month with no activity returns 200 with an empty `entries` list and a `total` of `0.00`.
+        It is not an error.
+
+        The monthly `total` is the net sum of all entries.
+      parameters:
+        - name: memberId
+          in: path
+          required: true
+          description: Identifier of the member whose report is requested.
+          schema:
+            type: string
+            minLength: 1
+          example: member-123
+        - name: month
+          in: path
+          required: true
+          description: Calendar month in `YYYY-MM` format, interpreted in the member's local timezone.
+          schema:
+            type: string
+            pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+          example: '2026-03'
+      responses:
+        '200':
+          description: The report for the requested month.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CashbackReport'
+              examples:
+                earningsAndClawback:
+                  summary: Two earnings and one refund clawback
+                  value:
+                    month: '2026-03'
+                    timezone: Pacific/Tongatapu
+                    entries:
+                      - postedAt: '2026-03-04T10:15:00+13:00'
+                        merchantId: grocery-mart
+                        cashback: 1.00
+                      - postedAt: '2026-03-12T18:40:00+13:00'
+                        merchantId: fuel-stop
+                        cashback: 0.60
+                      - postedAt: '2026-03-20T09:05:00+13:00'
+                        merchantId: grocery-mart
+                        cashback: -1.00
+                    total: 0.60
+                    capReached: false
+                capReached:
+                  summary: Monthly cap reached, part of one earning forfeited
+                  value:
+                    month: '2026-03'
+                    timezone: UTC
+                    entries:
+                      - postedAt: '2026-03-02T09:00:00Z'
+                        merchantId: grocery-mart
+                        cashback: 48.00
+                      - postedAt: '2026-03-28T17:30:00Z'
+                        merchantId: electronics-hub
+                        cashback: 2.00
+                    total: 50.00
+                    capReached: true
+                    forfeitedAmount: 3.00
+                noActivity:
+                  summary: No cashback activity in the month
+                  value:
+                    month: '2026-02'
+                    timezone: UTC
+                    entries: []
+                    total: 0.00
+                    capReached: false
+        '400':
+          description: The `month` is not a valid `YYYY-MM` value.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No member with this identifier exists.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+components:
+  schemas:
+    Money:
+      type: number
+      format: decimal
+      multipleOf: 0.01
+      description: |
+        Monetary amount with exactly 2 fraction digits. Parse as a decimal (`BigDecimal`), never as a
+        floating-point number. May be negative where stated.
+      example: 2.00
+    RegisterMemberRequest:
+      type: object
+      required: [memberId, timezone]
+      properties:
+        memberId:
+          type: string
+          minLength: 1
+          pattern: '\S'
+          description: Unique identifier of the member. Must not be blank.
+          example: member-123
+        timezone:
+          type: string
+          description: IANA timezone id of the member, used to decide which calendar month each purchase falls in.
+          example: Pacific/Tongatapu
+    PurchaseRequest:
+      type: object
+      required: [customerId, merchantId, amount]
+      properties:
+        customerId:
+          type: string
+          minLength: 1
+          pattern: '\S'
+          description: The member who made the purchase. Must not be blank.
+          example: member-123
+        merchantId:
+          type: string
+          minLength: 1
+          pattern: '\S'
+          description: Identifier of the merchant. Must not be blank. It is recorded in the report and does not need to be registered.
+          example: grocery-mart
+        mcc:
+          type: string
+          description: |
+            Merchant category code. Optional. Determines the cashback rate; a missing or unrecognised
+            code earns the Default rate.
+          example: '5411'
+        amount:
+          type: number
+          format: decimal
+          description: |
+            Purchase amount. Parse as a decimal (`BigDecimal`), never as a floating-point number.
+            Negative amounts are accepted (refunds) and produce a negative cashback.
+          example: 100.00
+        postedAt:
+          type: string
+          format: date-time
+          description: When the purchase was posted. Optional; defaults to the current time.
+          example: '2026-03-04T10:15:00Z'
+    PurchaseResponse:
+      type: object
+      required: [cashback]
+      properties:
+        cashback:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Cashback earned on the purchase, rounded half-up to 2 decimal places.
+    CashbackReport:
+      type: object
+      required: [month, timezone, entries, total, capReached]
+      properties:
+        month:
+          type: string
+          pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$'
+          description: The calendar month covered, in the member's local timezone.
+          example: '2026-03'
+        timezone:
+          type: string
+          description: IANA timezone of the member that was used to decide which month each event belongs to.
+          example: Pacific/Tongatapu
+        entries:
+          type: array
+          description: One entry per cashback event in the month, oldest first. Empty when there was no activity.
+          items:
+            $ref: '#/components/schemas/CashbackEntry'
+        total:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Net sum of all entry amounts. `0.00` when there are no entries. May be negative.
+        capReached:
+          type: boolean
+          description: True when the member's monthly cashback cap was reached during this month.
+        forfeitedAmount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: |
+            Cashback that would have been earned but was lost to the cap. Present only when
+            `capReached` is true; omitted otherwise.
+    CashbackEntry:
+      type: object
+      required: [postedAt, merchantId, cashback]
+      properties:
+        postedAt:
+          type: string
+          format: date-time
+          description: Posting time of the event, with the member's local UTC offset.
+          example: '2026-03-31T23:00:00+13:00'
+        merchantId:
+          type: string
+          description: Merchant where the purchase or refund happened.
+          example: grocery-mart
+        cashback:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Signed cashback amount. Positive for earnings, negative for refund clawbacks.
+    Problem:
+      type: object
+      description: RFC 9457 problem details. Contains no stack traces or infrastructure information.
+      required: [status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          example: about:blank
+        title:
+          type: string
+          example: Member not found
+        status:
+          type: integer
+          example: 404
+        detail:
+          type: string
+          example: 'Member not found: member-123'
+        instance:
+          type: string
+          format: uri-reference
+          description: The request path that produced the error.
+          example: /members/member-123/cashback-reports/2026-03
